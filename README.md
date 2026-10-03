@@ -2,9 +2,10 @@
 
 Genie-style transitions for macOS layers, with opening, closing, and mid-animation reversal. Built on [usagimaru’s GenieWarpMesh](https://github.com/usagimaru/GenieWarpMesh).
 
-[![Genie demo](docs/media/genie-ca-poster.jpg)](docs/media/genie-ca-live-blur.mp4)
 
-**[Watch the demo →](docs/media/genie-ca-live-blur.mp4)** · 60 fps video · Live AppKit blur · 0.5-second transitions
+https://github.com/user-attachments/assets/54fe4025-6b50-47c9-b723-90f4ef5f1a61
+
+60 fps video · Live AppKit blur · 0.5-second transitions
 
 ## Try it
 
