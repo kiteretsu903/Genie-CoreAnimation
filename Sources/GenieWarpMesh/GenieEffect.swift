@@ -30,6 +30,9 @@ public class GenieEffect {
 	/// アニメーションの長さ（秒）
 	public var duration: TimeInterval = 0.5
 
+    /// Feed content through the target near edge, using the measured reversible path.
+    public var passesThroughTarget = false
+
 	/// デバッグオーバーレイ（設定するとカーブ軌跡データを出力する）
 	public weak var debugOverlayReceiver: GenieDebugOverlay?
 
@@ -108,13 +111,51 @@ public class GenieEffect {
 
 	private weak var window: NSWindow?
 	private var displayLink: CADisplayLink?
-	private var startTime: CFTimeInterval = 0
+    // Native window/display identity is stable within an animation, including
+    // reversals. Refresh once per session (also after a display/window change).
+    private struct WarpSession {
+        let connection: CGSConnectionID
+        let windowID: CGSWindowID
+        let screenHeight: CGFloat
+        let pixel: CGFloat
+    }
+    private var warpSession: WarpSession?
+    private(set) var passageMesh: [CGSWarpPoint] = []
+    private(set) var passageColumns = 0
+    private(set) var passageRows = 0
+    private var clock = GenieAnimationClock()
+    private var animationRequestedAt: CFTimeInterval = 0
+    private var lastCallbackTime: CFTimeInterval?
+    public private(set) var diagnostics = GenieAnimationDiagnostics()
 	private var originalFrame: CGRect = .zero
 	private var targetRect: CGRect = .zero
 	private var direction: GenieDirection = .bottom
-	private var isAnimating = false
+	public private(set) var isAnimating = false
 	private var isReversed = false
 	private var completion: (() -> Void)?
+    public private(set) var currentProgress = 0.0
+    public private(set) var lastWarpError: CGError = .success
+    public var failureHandler: ((CGError) -> Void)?
+    public static var isAvailable: Bool { GWMAvailable() }
+
+    /// Stop callbacks and restore window geometry. Hide first when cancelling a close.
+    public func cancel(resetWarp: Bool = true) {
+        stopDisplayLink(); isAnimating = false; completion = nil
+        animationCorrectedFrame = nil
+        if resetWarp, let window { resetMeshWarp(for: window) }
+    }
+
+    /// Reverse the current path with symmetric easing, or the passage's directional clock.
+    /// Reuse the last displayed pose, not elapsed time, to avoid a jump on a busy main thread.
+    @discardableResult public func reverse(opening: Bool, completion: (() -> Void)?) -> Bool {
+        guard isAnimating else { return false }
+        self.completion = completion
+        if isReversed != opening {
+            clock.reverse(at:CACurrentMediaTime())
+            isReversed = opening
+        }
+        return true
+    }
 
 	/// アニメーション用の補正フレーム (Cocoa座標系)。nil なら補正なし。
 	private var animationCorrectedFrame: CGRect?
@@ -143,6 +184,7 @@ public class GenieEffect {
 						 direction: GenieDirection = .auto,
 						 completion: (() -> Void)? = nil) {
 		guard !isAnimating else { return }
+        resetDiagnostics()
 
 		// 前回の minimize でワープが残っている場合にリセット
 		resetMeshWarp(for: window)
@@ -153,6 +195,7 @@ public class GenieEffect {
 		self.targetRect = targetRect
 		self.direction = resolvedDirection
 		self.originalFrame = window.frame
+        prepareWarpSession(for:window)
 		self.isReversed = false
 		self.completion = completion
 
@@ -174,6 +217,7 @@ public class GenieEffect {
 						direction: GenieDirection = .auto,
 						completion: (() -> Void)? = nil) {
 		guard !isAnimating else { return }
+        resetDiagnostics()
 
 		// 前回の minimize でワープが残っている場合にリセット
 		resetMeshWarp(for: window)
@@ -184,6 +228,7 @@ public class GenieEffect {
 		self.targetRect = targetRect
 		self.direction = resolvedDirection
 		self.originalFrame = window.frame
+        prepareWarpSession(for:window)
 		self.isReversed = true
 		self.completion = completion
 
@@ -194,11 +239,13 @@ public class GenieEffect {
 			direction: resolvedDirection
 		)
 
-		// 吸い込み済み状態のワープを適用してから表示
-		window.alphaValue = 0
+        // The caller submits the prepared backing at normal opacity. Re-hiding
+        // a cold layer-backed source here can cache an invisible warp surface.
+        // Install the collapsed mesh before returning to the run loop.
+		window.alphaValue = 1
 		window.order(.above, relativeTo: 0)
 		applyMeshWarp(to: window, progress: 1.0, retreatProgress: animationCorrectedFrame != nil ? 1.0 : 0.0)
-		window.alphaValue = 1
+        guard lastWarpError == .success else { return }
 
 		startAnimation()
 	}
@@ -263,7 +310,7 @@ public class GenieEffect {
 												   direction: GenieDirection)
 	{
 		guard let overlay = debugOverlayReceiver else { return }
-		guard let screenHeight = NSScreen.main?.frame.height else { return }
+		guard let screenHeight = NSScreen.screens.first?.frame.maxY else { return }
 		
 		let resolvedDirection = direction.resolved(from: sourceFrame, to: targetFrame)
 
@@ -320,24 +367,9 @@ public class GenieEffect {
 		if skipCutoffOnRetreat && animationCorrectedFrame != nil && !isReversed {
 			cutoffStart = 0.0
 		}
-		startTime = CACurrentMediaTime() - (cutoffStart * duration)
+        clock.start(at:Double(cutoffStart))
+        currentProgress = isReversed ? 1 : 0
 
-		// アダプティブメッシュ: 方向に応じて解像度を動的に調整
-		if adaptiveMesh {
-			switch direction {
-			case .auto, .bottom, .top:
-				// 縦方向の吸い込み → 縦解像度を上げ、横解像度を下げる
-				effectiveGridWidth = adaptiveMin
-				effectiveGridHeight = adaptiveMax
-			case .left, .right:
-				// 横方向の吸い込み → 横解像度を上げ、縦解像度を下げる
-				effectiveGridWidth = adaptiveMax
-				effectiveGridHeight = adaptiveMin
-			}
-		} else {
-			effectiveGridWidth = gridWidth
-			effectiveGridHeight = gridHeight
-		}
 
 		// デバッグオーバーレイにカーブ情報を送る
 		updateDebugOverlay()
@@ -368,15 +400,24 @@ public class GenieEffect {
 		// アニメーション終了時にメッシュ外枠表示をクリア
 		debugOverlayReceiver?.clearMeshEdgePoints()
 
-		DispatchQueue.main.async { [weak self] in
-			self?.completion?()
-		}
+		let finished = completion
+        completion = nil
+        finished?()
 	}
 
 	// MARK: - Display Link
 
+    private func resetDiagnostics() {
+        animationRequestedAt = CACurrentMediaTime()
+        lastCallbackTime = nil
+        diagnostics = GenieAnimationDiagnostics()
+    }
+
 	private func startDisplayLink() {
-		guard let screen = window?.screen ?? NSScreen.main else { return }
+		guard let screen = window?.screen ?? NSScreen.main else {
+            fail(.cannotComplete)
+            return
+        }
 		let link = screen.displayLink(target: self, selector: #selector(displayLinkCallback(_:)))
 		link.add(to: .main, forMode: .common)
 		displayLink = link
@@ -388,19 +429,31 @@ public class GenieEffect {
 	}
 
 	@objc private func displayLinkCallback(_ link: CADisplayLink) {
-		tick()
+        let callbackTime = CACurrentMediaTime()
+        if let previous = lastCallbackTime {
+            diagnostics.maxCallbackGap = max(diagnostics.maxCallbackGap,callbackTime-previous)
+        } else {
+            diagnostics.firstCallbackDelay = max(0,callbackTime-animationRequestedAt)
+        }
+        lastCallbackTime = callbackTime
+        diagnostics.frameCount += 1
+        // The pose belongs to the upcoming refresh, not the (jittering) time at
+        // which the main run loop delivered this callback. Keep the same curve
+        // and duration while avoiding callback latency in the animation clock.
+        let target = link.targetTimestamp
+        diagnostics.recordTarget(target)
+        tick(at:target.isFinite && target > 0 ? target : callbackTime)
 	}
 
 	// MARK: - Per-frame Update
 
-	private func tick() {
+	private func tick(at presentationTime: CFTimeInterval) {
 		guard isAnimating, let window = window else {
 			if isAnimating { finishAnimation() }
 			return
 		}
 
-		let elapsed = CACurrentMediaTime() - startTime
-		let rawT = min(elapsed / duration, 1.0)
+        let rawT = clock.advance(to:presentationTime,duration:duration)
 
 		// イージングカーブをそのまま適用。
 		// 逆再生の場合は関数を反転。
@@ -437,17 +490,21 @@ public class GenieEffect {
 				finalRetreat = 0.0
 			}
 			applyMeshWarp(to: window, progress: finalT, retreatProgress: finalRetreat)
-			progressHandler?(finalT)
+			guard isAnimating else { return }
+            currentProgress = finalT
+            progressHandler?(finalT)
 			finishAnimation()
 		} else {
 			applyMeshWarp(to: window, progress: t, retreatProgress: retreatProgress)
-			progressHandler?(t)
+			guard isAnimating else { return }
+            currentProgress = t
+            progressHandler?(t)
 		}
 	}
 
 	/// easingType に基づいてイージングを計算
 	private func genieEase(_ t: Double, reversed: Bool = false) -> Double {
-		var r = easingType.function(t)
+		var r = passesThroughTarget ? t : easingType.function(t)
 		if reversed { r = 1.0 - r }
 		return r
 	}
@@ -456,7 +513,7 @@ public class GenieEffect {
 
 	private func updateDebugOverlay() {
 		guard let overlay = debugOverlayReceiver else { return }
-		guard let screenHeight = NSScreen.main?.frame.height else { return }
+		guard let screenHeight = NSScreen.screens.first?.frame.maxY else { return }
 
 		let frame = originalFrame
 		let cgFrameY = screenHeight - frame.origin.y - frame.height
@@ -551,20 +608,51 @@ public class GenieEffect {
 
 	// MARK: - Mesh Warp
 
+    private func prepareWarpSession(for window: NSWindow) {
+        guard let screenHeight = NSScreen.screens.first?.frame.maxY else { warpSession = nil; return }
+        warpSession = WarpSession(connection:GWMMainConnectionID(),windowID:CGSWindowID(window.windowNumber),
+                                  screenHeight:screenHeight,pixel:1/max(1,window.backingScaleFactor))
+        // Set resolution before priming the hidden opening mesh as well.
+		// アダプティブメッシュ: 方向に応じて解像度を動的に調整
+		if adaptiveMesh {
+			switch direction {
+			case .auto, .bottom, .top:
+				// 縦方向の吸い込み → 縦解像度を上げ、横解像度を下げる
+				effectiveGridWidth = adaptiveMin
+				effectiveGridHeight = adaptiveMax
+			case .left, .right:
+				// 横方向の吸い込み → 横解像度を上げ、縦解像度を下げる
+				effectiveGridWidth = adaptiveMax
+				effectiveGridHeight = adaptiveMin
+			}
+		} else {
+			effectiveGridWidth = gridWidth
+			effectiveGridHeight = gridHeight
+		}
+
+        // UVs depend on the source size; rebuild once per session and reuse the
+        // same storage for all frames, including rapid reversals.
+        passageColumns = 0; passageRows = 0
+    }
+
 	private func resetMeshWarp(for window: NSWindow) {
-		let cid = CGSMainConnectionID()
+		let cid = GWMMainConnectionID()
 		let wid = CGSWindowID(window.windowNumber)
-		CGSSetWindowWarp(cid, wid, 0, 0, nil)
+		GWMSetWindowWarp(cid, wid, 0, 0, nil)
 	}
+
+    private func fail(_ error: CGError) {
+        lastWarpError = error
+        cancel()
+        failureHandler?(error)
+    }
 
 	/// progress: 0.0 = 通常の矩形, 1.0 = 完全に吸い込まれた状態
 	/// retreatProgress: 退避移動の進行度 (0→1)。生の時間 t から smoothstep で計算済み。
 	private func applyMeshWarp(to window: NSWindow, progress: Double, retreatProgress: CGFloat = 0.0) {
-		let cid = CGSMainConnectionID()
-		let wid = CGSWindowID(window.windowNumber)
-		let frame = originalFrame
-
-		guard let screenHeight = NSScreen.main?.frame.height else { return }
+        guard let session = warpSession else { fail(.cannotComplete); return }
+        let cid = session.connection, wid = session.windowID
+        let frame = originalFrame, screenHeight = session.screenHeight
 
 		// Cocoa座標系（左下原点）→ CG座標系（左上原点）
 		let cgFrameY = screenHeight - frame.origin.y - frame.height
@@ -595,6 +683,12 @@ public class GenieEffect {
 			computeCgFrameY = cgFrameY
 		}
 
+        if passesThroughTarget {
+            applyPassageWarp(to:window,frame:computeFrame,cgFrameY:computeCgFrameY,
+                             screenHeight:screenHeight,time:p)
+            return
+        }
+
 		let gw = effectiveGridWidth
 		let gh = effectiveGridHeight
 
@@ -622,13 +716,17 @@ public class GenieEffect {
 
 				let index = row * gw + col
 				mesh[index] = CGSWarpPoint(
-					local: CGSMeshPoint(x: Float(round(localX)), y: Float(round(localY))),
-					global: CGSMeshPoint(x: Float(round(globalPoint.x)), y: Float(round(globalPoint.y)))
+					local: CGSMeshPoint(x: Float(localX), y: Float(localY)),
+					global: CGSMeshPoint(x: Float(globalPoint.x), y: Float(globalPoint.y))
 				)
 			}
 		}
 
-		CGSSetWindowWarp(cid, wid, Int32(gw), Int32(gh), mesh)
+		lastWarpError = GWMSetWindowWarp(cid, wid, Int32(gw), Int32(gh), mesh)
+        if lastWarpError != .success {
+            fail(lastWarpError)
+            return
+        }
 
 		// デバッグオーバーレイにメッシュ外枠の交点を送る（CG座標系）
 		if debugOverlayReceiver != nil {
@@ -663,6 +761,51 @@ public class GenieEffect {
 			)
 		}
 	}
+
+    private func applyPassageWarp(to window: NSWindow, frame: CGRect, cgFrameY: CGFloat,
+                                  screenHeight: CGFloat, time: CGFloat) {
+        guard let session = warpSession else { fail(.cannotComplete); return }
+        let passage = GeniePassage(
+            frame:CGRect(x:frame.minX,y:cgFrameY,width:frame.width,height:frame.height),
+            entry:CGRect(x:targetRect.minX,y:screenHeight-targetRect.maxY,
+                         width:targetRect.width,height:targetRect.height),
+            direction:direction,time:time,pixel:session.pixel)
+        if !passage.hasVisibleArea && !isReversed {
+            // Hide a completed passage before submitting any degenerate mesh.
+            window.alphaValue = 0
+            return
+        }
+        // Every cross-axis row is affine. Two endpoints are sufficient; extra
+        // columns only multiply the extremely thin terminal triangles.
+        let vertical = direction == .bottom || direction == .top || direction == .auto
+        let gw = vertical ? 2 : effectiveGridWidth
+        let gh = vertical ? effectiveGridHeight : 2
+        if passageColumns != gw || passageRows != gh || passageMesh.count != gw*gh {
+            passageColumns = gw; passageRows = gh
+            passageMesh = (0..<gw*gh).map { index in
+                CGSWarpPoint(local:CGSMeshPoint(x:Float(CGFloat(index%gw)/CGFloat(gw-1)*originalFrame.width),
+                                               y:Float(CGFloat(index/gw)/CGFloat(gh-1)*originalFrame.height)),
+                             global:CGSMeshPoint(x:0,y:0))
+            }
+        }
+        let visible = passage.hasVisibleArea
+        for row in 0..<gh {
+            for col in 0..<gw {
+                let x = CGFloat(col)/CGFloat(gw-1), y = CGFloat(row)/CGFloat(gh-1)
+                let point = visible ? passage.point(x:x,y:y) : passage.terminalPoint(x:x,y:y)
+                passageMesh[row*gw+col].global = CGSMeshPoint(x:Float(point.x),y:Float(point.y))
+            }
+        }
+        let submissionStarted = CACurrentMediaTime()
+        lastWarpError = passageMesh.withUnsafeBufferPointer {
+            GWMSetWindowWarp(session.connection,session.windowID,Int32(gw),Int32(gh),$0.baseAddress)
+        }
+        diagnostics.recordSubmission(start:submissionStarted,end:CACurrentMediaTime())
+        guard lastWarpError == .success else {
+            fail(lastWarpError); return
+        }
+        if window.alphaValue != 1 { window.alphaValue = 1 }
+    }
 
 	// MARK: - Mesh Warp Geometry
 	//

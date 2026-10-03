@@ -7,6 +7,7 @@ let package = Package(
 	products: [
 		.library(name: "GenieWarpMesh", targets: ["GenieWarpMesh"]),
 		.library(name: "CGSPrivate", targets: ["CGSPrivate"]),
+        .executable(name: "GenieCADemo", targets: ["GenieCADemo"]),
 	],
 	targets: [
 		.target(
@@ -20,5 +21,7 @@ let package = Package(
 			path: "Sources/GenieWarpMesh",
 			linkerSettings: [.linkedFramework("CoreGraphics")]
 		),
+        .executableTarget(name: "GenieCADemo", dependencies: ["GenieWarpMesh"], path: "Examples/GenieCADemo", resources: [.copy("Resources/glacier-blue.png")]),
+        .testTarget(name: "GenieWarpMeshTests", dependencies: ["GenieWarpMesh"]),
 	]
 )
